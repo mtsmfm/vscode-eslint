@@ -154,6 +154,24 @@
 						"javascriptreact"
 					],
 					"description": "An array of language ids which should be validated by ESLint"
+				},
+				"eslint.commandWithArgs": {
+					"scope": "resource",
+					"type": "array",
+					"default": null,
+					"description": "Command with args to execute eslint"
+				},
+				"eslint.localRoot": {
+					"scope": "resource",
+					"type": "string",
+					"default": null,
+					"description": "Path to the local directory containing the program."
+				},
+				"eslint.remoteRoot": {
+					"scope": "resource",
+					"type": "string",
+					"default": null,
+					"description": "Absolute path to the remote directory containing the program."
 				}
 			}
 		},

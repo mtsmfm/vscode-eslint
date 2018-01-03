@@ -16,7 +16,7 @@ import {
 	ErrorAction, CloseAction, State as ClientState,
 	RevealOutputChannelOn, VersionedTextDocumentIdentifier, ExecuteCommandRequest, ExecuteCommandParams,
 	ServerOptions, Proposed, DocumentFilter, DidCloseTextDocumentNotification, DidOpenTextDocumentNotification,
-	CancellationToken, WorkspaceMiddleware
+	CancellationToken, WorkspaceMiddleware, StaticFeature, InitializeParams
 } from 'vscode-languageclient';
 
 const eslintrc: string = [
@@ -260,33 +260,54 @@ function shouldBeValidated(textDocument: TextDocument): boolean {
 	return false;
 }
 
+function getOuterMostWorkspaceFolder(textDocument: TextDocument): VWorkspaceFolder {
+	function withTrailingSlash(str: string): string {
+		return str.endsWith('/') ? str : str + '/'
+	}
+
+	const folder = withTrailingSlash(Workspace.getWorkspaceFolder(textDocument.uri).uri.toString());
+	return Workspace.workspaceFolders.filter(f => withTrailingSlash(f.uri.toString()).startsWith(folder)).sort((a, b) => a.uri.toString().length - b.uri.toString().length)[0];
+}
+
+let defaultClient: LanguageClient;
+const clients: Map<VWorkspaceFolder, LanguageClient> = new Map();
+
 export function activate(context: ExtensionContext) {
-	let activated: boolean;
 	let openListener: Disposable;
 	let configurationListener: Disposable;
-	function didOpenTextDocument(textDocument: TextDocument) {
-		if (activated) {
+
+	function foo(textDocument: TextDocument) {
+		if (!shouldBeValidated(textDocument)) {
 			return;
 		}
-		if (shouldBeValidated(textDocument)) {
-			openListener.dispose();
-			configurationListener.dispose();
-			activated = true;
-			realActivate(context);
-		}
-	}
-	function configurationChanged() {
-		if (activated) {
-			return;
-		}
-		for (let textDocument of Workspace.textDocuments) {
-			if (shouldBeValidated(textDocument)) {
-				openListener.dispose();
-				configurationListener.dispose();
-				activated = true;
-				realActivate(context);
+
+		if (textDocument.uri.scheme == 'untitled') {
+			if (defaultClient) {
 				return;
 			}
+
+			defaultClient = realActivate(context);
+		} else {
+			const folder = getOuterMostWorkspaceFolder(textDocument)
+
+			if (clients.has(folder)) {
+				return ;
+			}
+
+			clients.set(folder, realActivate(context, folder));
+		}
+
+		openListener.dispose();
+		configurationListener.dispose();
+	}
+
+	function didOpenTextDocument(textDocument: TextDocument) {
+		foo(textDocument)
+	}
+
+	function configurationChanged() {
+		for (let textDocument of Workspace.textDocuments) {
+			foo(textDocument)
 		}
 	}
 	openListener = Workspace.onDidOpenTextDocument(didOpenTextDocument);
@@ -306,7 +327,17 @@ export function activate(context: ExtensionContext) {
 	configurationChanged();
 }
 
-export function realActivate(context: ExtensionContext) {
+class SuppressProcessIdFeature implements StaticFeature {
+	fillInitializeParams(params: InitializeParams) {
+		params['processId'] = null
+	}
+
+	fillClientCapabilities() { }
+
+	initialize() {}
+}
+
+export function realActivate(context: ExtensionContext, folder?: VWorkspaceFolder): LanguageClient {
 
 	let statusBarItem = Window.createStatusBarItem(StatusBarAlignment.Right, 0);
 	let eslintStatus: Status = Status.ok;
@@ -351,10 +382,25 @@ export function realActivate(context: ExtensionContext) {
 	// the output folder.
 	// serverModule
 	let serverModule = context.asAbsolutePath(path.join('server', 'out', 'server.js'));
-	let serverOptions: ServerOptions = {
-		run: { module: serverModule, transport: TransportKind.ipc, options: { cwd: process.cwd() } },
-		debug: { module: serverModule, transport: TransportKind.ipc, options: { execArgv: ["--nolazy", "--inspect=6010"], cwd: process.cwd() } }
+	let documentFilter: DocumentFilter;
+	const defaultServerOptions = {
+		run: { module: serverModule, transport: TransportKind.stdio, options: { cwd: process.cwd() } },
+		debug: { module: serverModule, transport: TransportKind.stdio, options: { execArgv: ["--nolazy", "--inspect=6010"], cwd: process.cwd() } }
 	};
+	let serverOptions: ServerOptions = defaultServerOptions;
+
+	if (folder) {
+		const [command, ...args] = Workspace.getConfiguration('eslint', folder.uri).get("commandWithArgs")
+
+		if (command) {
+			serverOptions = {
+				command, args, options: { cwd: Workspace.rootPath }
+			}
+		}
+		documentFilter = { scheme: 'file', pattern: `${folder.uri.fsPath}/**/*` }
+	} else {
+		documentFilter = { scheme: 'untitled' }
+	}
 
 	let defaultErrorHandler: ErrorHandler;
 	let serverCalledProcessExit: boolean = false;
@@ -377,8 +423,12 @@ export function realActivate(context: ExtensionContext) {
 			}
 		}
 	});
+
+	const localRoot = folder ? (<string>Workspace.getConfiguration('eslint', folder.uri).get('localRoot')).replace(/\${workspaceRoot}/g, folder.uri.path) : null
+	const remoteRoot = folder ? <string>Workspace.getConfiguration('eslint', folder.uri).get('remoteRoot') : null
+
 	let clientOptions: LanguageClientOptions = {
-		documentSelector: [{ scheme: 'file' }, { scheme: 'untitled'}],
+		documentSelector: [documentFilter],
 		diagnosticCollectionName: 'eslint',
 		revealOutputChannelOn: RevealOutputChannelOn.Never,
 		synchronize: {
@@ -413,6 +463,26 @@ export function realActivate(context: ExtensionContext) {
 					return CloseAction.DoNotRestart;
 				}
 				return defaultErrorHandler.closed();
+			}
+		},
+		uriConverters: {
+			code2Protocol: (value) => {
+				if (localRoot && remoteRoot) {
+					const p = path.join(remoteRoot, path.relative(localRoot, value.path));
+					return Object.assign(new Uri(), value, {path: p}).toString();
+				} else {
+					return value.toString();
+				}
+			},
+			protocol2Code: (value) => {
+				const uri = Uri.parse(value)
+
+				if (localRoot && remoteRoot) {
+					const p = path.join(localRoot, path.relative(remoteRoot, uri.path));
+					return Object.assign(new Uri(), uri, {path: p});
+				} else {
+					return uri;
+				}
 			}
 		},
 		middleware: {
@@ -494,7 +564,7 @@ export function realActivate(context: ExtensionContext) {
 							workspaceFolder: undefined,
 							library: undefined
 						}
-						let document: TextDocument = syncedDocuments.get(item.scopeUri);
+						let document: TextDocument = syncedDocuments.get(resource.toString());
 						if (!document) {
 							result.push(settings);
 							continue;
@@ -576,6 +646,9 @@ export function realActivate(context: ExtensionContext) {
 
 	let client = new LanguageClient('ESLint', serverOptions, clientOptions);
 	client.registerProposedFeatures();
+	if (remoteRoot) {
+		client.registerFeature(new SuppressProcessIdFeature())
+	}
 	defaultErrorHandler = client.createDefaultErrorHandler();
 	const running = 'ESLint server is running.';
 	const stopped = 'ESLint server stopped.'
@@ -714,6 +787,8 @@ export function realActivate(context: ExtensionContext) {
 		Commands.registerCommand('eslint.showOutputChannel', () => { client.outputChannel.show(); }),
 		statusBarItem
 	);
+
+	return client;
 }
 
 export function deactivate() {
